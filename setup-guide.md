@@ -31,11 +31,16 @@ AWS Lambda (app.handler)
 - Grafana alerting already configured (you'll set the webhook URL after
   creating the API Gateway)
 
+> **Note:** All AWS CLI commands in this guide use `--profile terraform-account`.
+> If your credentials are in a different profile, adjust accordingly.
+
 ## Step 1: Create the Lambda Execution IAM Role
 
 ### 1a. Create the role with a trust policy
 
 ```bash
+PROFILE="terraform-account"
+
 cat > trust-policy.json << 'EOF'
 {
   "Version": "2012-10-17",
@@ -51,7 +56,8 @@ EOF
 
 aws iam create-role \
   --role-name self-healing-lambda-role \
-  --assume-role-policy-document file://trust-policy.json
+  --assume-role-policy-document file://trust-policy.json \
+  --profile $PROFILE
 ```
 
 Note the role ARN — you'll need it in every step that follows:
@@ -60,7 +66,8 @@ Note the role ARN — you'll need it in every step that follows:
 ROLE_ARN=$(aws iam get-role \
   --role-name self-healing-lambda-role \
   --query 'Role.Arn' \
-  --output text)
+  --output text \
+  --profile $PROFILE)
 echo $ROLE_ARN
 ```
 
@@ -69,7 +76,8 @@ echo $ROLE_ARN
 ```bash
 aws iam attach-role-policy \
   --role-name self-healing-lambda-role \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
+  --profile $PROFILE
 ```
 
 ### 1c. Add inline policy for STS (EKS token generation)
@@ -94,7 +102,8 @@ EOF
 aws iam put-role-policy \
   --role-name self-healing-lambda-role \
   --policy-name sts-getcalleridentity \
-  --policy-document file://sts-policy.json
+  --policy-document file://sts-policy.json \
+  --profile $PROFILE
 ```
 
 ## Step 2: Grant EKS Access to the Lambda Role
@@ -102,14 +111,21 @@ aws iam put-role-policy \
 ### Check your cluster's authentication mode
 
 ```bash
+EKS_CLUSTER_NAME="togglemaster-eks"
+
 aws eks describe-cluster \
-  --name <EKS_CLUSTER_NAME> \
+  --name $EKS_CLUSTER_NAME \
   --query 'cluster.accessConfig.authenticationMode' \
-  --output text
+  --output text \
+  --profile $PROFILE
 ```
 
 - `API` or `API_AND_CONFIG_MAP` → use **Option A** (EKS Access Entries)
 - `CONFIG_MAP` → use **Option B** (aws-auth ConfigMap)
+
+> This cluster uses `API_AND_CONFIG_MAP` (set in the Terraform IaC with
+> `bootstrap_cluster_creator_admin_permissions = true`), so **Option A**
+> is the recommended path.
 
 ### Option A: EKS Access Entry (recommended)
 
@@ -118,9 +134,10 @@ The group is what the RBAC RoleBinding binds to (Step 3):
 
 ```bash
 aws eks create-access-entry \
-  --cluster-name <EKS_CLUSTER_NAME> \
+  --cluster-name $EKS_CLUSTER_NAME \
   --principal-arn $ROLE_ARN \
-  --kubernetes-groups self-healing
+  --kubernetes-groups self-healing \
+  --profile $PROFILE
 ```
 
 ### Option B: aws-auth ConfigMap (legacy)
@@ -132,7 +149,7 @@ kubectl edit configmap aws-auth -n kube-system
 Add this entry under `data.mapRoles`:
 
 ```yaml
-- rolearn: <LAMBDA_ROLE_ARN>
+- rolearn: $ROLE_ARN
   username: self-healing
   groups:
     - self-healing
@@ -141,8 +158,7 @@ Add this entry under `data.mapRoles`:
 ## Step 3: Create Kubernetes RBAC
 
 The Lambda only needs to `patch` Deployments in one namespace. Save this
-YAML as `rbac.yaml` — replace `<ALLOWED_NAMESPACE>` with your target
-namespace (e.g. `production`):
+YAML as `rbac.yaml`:
 
 ```yaml
 ---
@@ -150,7 +166,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: self-healing-restart
-  namespace: <ALLOWED_NAMESPACE>
+  namespace: toggle-prod
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
@@ -160,7 +176,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: self-healing-restart
-  namespace: <ALLOWED_NAMESPACE>
+  namespace: toggle-prod
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -196,19 +212,21 @@ zip function.zip app.py
 ### 4b. Gather EKS cluster details
 
 ```bash
-EKS_CLUSTER_NAME="<your-cluster-name>"
+EKS_CLUSTER_NAME="togglemaster-eks"
 
 CLUSTER_ENDPOINT=$(aws eks describe-cluster \
   --name $EKS_CLUSTER_NAME \
   --query 'cluster.endpoint' \
-  --output text)
+  --output text \
+  --profile $PROFILE)
 
 CA_CERT=$(aws eks describe-cluster \
   --name $EKS_CLUSTER_NAME \
   --query 'cluster.certificateAuthority.data' \
-  --output text)
+  --output text \
+  --profile $PROFILE)
 
-AWS_REGION=$(aws configure get region)
+AWS_REGION=$(aws configure get region --profile $PROFILE)
 ```
 
 ### 4c. Create the Lambda
@@ -222,6 +240,10 @@ echo "Save this token: $WEBHOOK_TOKEN"
 
 Create the function with all environment variables:
 
+> **Note:** `AWS_REGION` is a reserved Lambda environment variable. Lambda
+> injects it automatically at runtime, so do not include it in the
+> `--environment` flag. The handler reads it via `os.environ["AWS_REGION"]`.
+
 ```bash
 aws lambda create-function \
   --function-name self-healing-restart \
@@ -231,13 +253,13 @@ aws lambda create-function \
   --zip-file fileb://function.zip \
   --timeout 30 \
   --memory-size 256 \
+  --profile $PROFILE \
   --environment "Variables={\
 WEBHOOK_BEARER_TOKEN=$WEBHOOK_TOKEN,\
-ALLOWED_NAMESPACE=<your-namespace>,\
+ALLOWED_NAMESPACE=toggle-prod,\
 EKS_CLUSTER_NAME=$EKS_CLUSTER_NAME,\
 EKS_CLUSTER_ENDPOINT=$CLUSTER_ENDPOINT,\
-EKS_CLUSTER_CA_CERTIFICATE_BASE64=$CA_CERT,\
-AWS_REGION=$AWS_REGION}"
+EKS_CLUSTER_CA_CERTIFICATE_BASE64=$CA_CERT}"
 ```
 
 ### Environment Variables Reference
@@ -245,11 +267,11 @@ AWS_REGION=$AWS_REGION}"
 | Variable | Required | Example | Purpose |
 | --- | --- | --- | --- |
 | `WEBHOOK_BEARER_TOKEN` | Yes | (random hex string) | Shared secret validated against Grafana's `Authorization` header |
-| `ALLOWED_NAMESPACE` | Yes | `production` | Only this namespace can be restarted |
-| `EKS_CLUSTER_NAME` | Yes | `my-cluster` | Used to sign the EKS bearer token (x-k8s-aws-id header) |
+| `ALLOWED_NAMESPACE` | Yes | `toggle-prod` | Only this namespace can be restarted |
+| `EKS_CLUSTER_NAME` | Yes | `togglemaster-eks` | Used to sign the EKS bearer token (x-k8s-aws-id header) |
 | `EKS_CLUSTER_ENDPOINT` | Yes | `https://...eks.amazonaws.com` | Kubernetes API URL |
 | `EKS_CLUSTER_CA_CERTIFICATE_BASE64` | Yes | (base64 string) | Cluster CA certificate for TLS verification |
-| `AWS_REGION` | Yes | `us-east-1` | Region for STS and the EKS cluster |
+| `AWS_REGION` | Automatic | `us-east-1` | Set automatically by the Lambda runtime — do not set manually |
 
 ## Step 5: Create the API Gateway (HTTP API)
 
@@ -271,19 +293,25 @@ The API Gateway provides the HTTPS endpoint that Grafana calls.
 LAMBDA_ARN=$(aws lambda get-function \
   --function-name self-healing-restart \
   --query 'Configuration.FunctionArn' \
-  --output text)
+  --output text \
+  --profile $PROFILE)
 
 API_ID=$(aws apigatewayv2 create-api \
   --name self-healing-webhook \
   --protocol-type HTTP \
   --target $LAMBDA_ARN \
   --query 'ApiId' \
-  --output text)
+  --output text \
+  --profile $PROFILE)
 
 echo "Webhook URL: https://$API_ID.execute-api.$AWS_REGION.amazonaws.com/"
 ```
 
 If using the CLI, grant API Gateway permission to invoke the Lambda:
+
+> **Note:** HTTP APIs use the `$default` route key, not the REST API `POST/`
+> path format. The source ARN must end with `/*` to match any route/method
+> on the HTTP API.
 
 ```bash
 aws lambda add-permission \
@@ -291,7 +319,8 @@ aws lambda add-permission \
   --statement-id apigateway-invoke \
   --action lambda:InvokeFunction \
   --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:$AWS_REGION:$(aws sts get-caller-identity --query Account --output text):$API_ID/*/*/POST/"
+  --source-arn "arn:aws:execute-api:$AWS_REGION:$(aws sts get-caller-identity --query Account --output text --profile $PROFILE):$API_ID/*" \
+  --profile $PROFILE
 ```
 
 ## Step 6: Network Access to the EKS API
@@ -310,7 +339,8 @@ Check your endpoint type:
 aws eks describe-cluster \
   --name $EKS_CLUSTER_NAME \
   --query 'cluster.resourcesVpcConfig.endpointPublicAccess' \
-  --output text
+  --output text \
+  --profile $PROFILE
 ```
 
 ## Step 7: Grafana Webhook Reference
@@ -332,7 +362,7 @@ The alert payload must include `namespace` and `deployment` labels:
       "status": "firing",
       "labels": {
         "alertname": "HighErrorRate",
-        "namespace": "production",
+        "namespace": "toggle-prod",
         "deployment": "auth-service"
       }
     }
@@ -359,7 +389,7 @@ curl -s -X POST \
       "status": "firing",
       "labels": {
         "alertname": "HighErrorRate",
-        "namespace": "production",
+        "namespace": "toggle-prod",
         "deployment": "auth-service"
       }
     }]
@@ -376,16 +406,39 @@ Expected response:
 ### Check CloudWatch Logs
 
 ```bash
-aws logs tail /aws/lambda/self-healing-restart --follow
+aws logs tail /aws/lambda/self-healing-restart --follow \
+  --profile $PROFILE
 ```
 
 ### Verify the rolling restart
 
+`kubectl rollout status` confirms the deployment is healthy, but it
+doesn't prove a restart actually happened. Check these two things instead:
+
+**1. Pod age** — recently recreated pods have a young age (seconds to
+minutes). If the pods are hours old, the restart didn't trigger:
+
 ```bash
-kubectl rollout status deployment/auth-service -n production
+kubectl get pods -n toggle-prod -l app=auth-service
 ```
 
-You should see pods being recreated.
+**2. `restartedAt` annotation** — this is the exact annotation the Lambda
+patches. The timestamp should match when the webhook was called:
+
+```bash
+kubectl get deployment auth-service -n toggle-prod \
+  -o jsonpath='{.spec.template.metadata.annotations.kubectl\.kubernetes\.io/restartedAt}'
+```
+
+**Watch it live** — open two terminals. In the first, watch pods being
+recreated:
+
+```bash
+kubectl get pods -n toggle-prod -l app=auth-service -w
+```
+
+In the second, send the webhook test (see above). You'll see the old pod
+terminate and a new one spin up within a few seconds.
 
 ## Troubleshooting
 
